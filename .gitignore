@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Local configs (if any)
+config.ini
+*.json
+
+# Bot generated
+allowed_users.json
+
+# OS files
+.DS_Store
+Thumbs.db
