@@ -10,28 +10,10 @@ from typing import Optional
 import requests
 from telegram import ReplyKeyboardMarkup, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+    Application, ExtBot, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 )
 import unicodedata
 from datetime import datetime, timedelta
-from flask import Flask
-import threading
-import os
-
-# Flask app for Render health checks
-flask_app = Flask(__name__)
-
-@flask_app.route('/')
-def home():
-    return "K RAW LOTTERY AUTO BET BOT is running!"
-
-@flask_app.route('/health')
-def health():
-    return "OK", 200
-
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    flask_app.run(host='0.0.0.0', port=port)
 
 # Logging configuration
 logging.basicConfig(
@@ -46,19 +28,12 @@ PLATFORM_URLS = {
     "777bigwingame": "https://api.bigwinqaz.com/api/webapi/"
 }
 
-# Platform display names
-PLATFORM_NAMES = {
-    "6lottery": "🔴 6lottery",
-    "Cklottery": "🔵 Cklottery",
-    "777bigwingame": "🟢 777bigwin"
-}
-
 # Config
 BOT_TOKEN = "8611174345:AAFAEhsH5ZvKso08kJD-A4wqlCv6b2sot4M" 
 IGNORE_SSL = True
 WIN_LOSE_CHECK_INTERVAL = 3
 MAX_RESULT_WAIT_TIME = 90
-ADMIN_ID = 6736719959
+ADMIN_ID =  6736719959
 MAX_BALANCE_RETRIES = 10
 BALANCE_RETRY_DELAY = 5
 BALANCE_API_TIMEOUT = 30
@@ -93,32 +68,32 @@ user_pending_bets = {}
 user_waiting_for_result = {}
 user_stats = {}
 user_game_info = {}
-allowed_user_ids = {}  # ingame_id -> permission data
+allowed_777bigwin_ids = set()
 next_bet_time = None
 next_bet_issue = None
 streak_bet_count = 0
 
 # Persistence helpers
 def load_allowed_users():
-    global allowed_user_ids
+    global allowed_777bigwin_ids
     try:
-        with open('allowed_users.json', 'r') as f:
+        with open('users_777bigwin.json', 'r') as f:
             data = json.load(f)
-            allowed_user_ids = data.get('allowed_users', {})
-            logging.info(f"Loaded {len(allowed_user_ids)} authorized users")
+            allowed_777bigwin_ids = set(data.get('allowed_ids', []))
+            logging.info(f"Loaded {len(allowed_777bigwin_ids)} users")
     except FileNotFoundError:
-        logging.warning("allowed_users.json not found. Starting fresh")
-        allowed_user_ids = {}
+        logging.warning("users_777bigwin.json not found. Starting fresh")
+        allowed_777bigwin_ids = set()
     except Exception as e:
-        logging.error(f"Error loading allowed_users.json: {e}")
-        allowed_user_ids = {}
+        logging.error(f"Error loading users_777bigwin.json: {e}")
+        allowed_777bigwin_ids = set()
 
 def save_allowed_users():
-    global allowed_user_ids
+    global allowed_777bigwin_ids
     try:
-        with open('allowed_users.json', 'w') as f:
-            json.dump({'allowed_users': allowed_user_ids}, f, indent=4)
-            logging.info(f"Saved {len(allowed_user_ids)} authorized users")
+        with open('users_777bigwin.json', 'w') as f:
+            json.dump({'allowed_ids': list(allowed_777bigwin_ids)}, f, indent=4)
+            logging.info(f"Saved {len(allowed_777bigwin_ids)} users")
     except Exception as e:
         logging.error(f"Error saving user list: {e}")
 
@@ -143,8 +118,13 @@ def sign_md5_original(data: dict) -> str:
 def compute_unit_amount(_amt: int) -> int:
     if _amt <= 0:
         return 1
+
     amt_str = str(_amt)
+
+    # Count trailing zeros
     trailing_zeros = len(amt_str) - len(amt_str.rstrip('0'))
+
+    # Decide unit based on trailing zeros
     if trailing_zeros == 4:
         return 10000
     elif trailing_zeros == 3:
@@ -154,6 +134,7 @@ def compute_unit_amount(_amt: int) -> int:
     elif trailing_zeros == 1:
         return 10
     else:
+        # If no trailing zero, fallback to nearest power of 10
         length = len(amt_str)
         return 10 ** (length - 1)
 
@@ -162,7 +143,20 @@ def get_select_map(game_type: str):
         return {"B": 13, "S": 14}
     return {"B": 13, "S": 14}
 
+def calculate_blockid_sum(block_id: str) -> int:
+    digits = [int(c) for c in block_id if c.isdigit()]
+    total = sum(digits)
+    while total > 9:
+        total = sum(int(d) for d in str(total))
+    return total
+
+def get_random_interval():
+    if random.random() < 0.4:
+        return random.randint(10, 20)
+    return random.randint(20, 40)
+
 def get_strategy_display_name(settings: dict) -> str:
+    """Get strategy display name without revealing the pattern"""
     pattern_type = settings.get("pattern_type", "sequential")
     
     if pattern_type == "lottery_follow":
@@ -171,6 +165,7 @@ def get_strategy_display_name(settings: dict) -> str:
         return "🧠 Lottery Brain"
     elif pattern_type == "sequential":
         pattern = settings.get("pattern", "")
+        # Check which predefined pattern matches
         if pattern == "SBSBSBBSBSBBSBBSSBSBSBBBSBBBSSSBSBSBBSBSSSBSSSBBBBSSSBSBSBBBSSSSBBBBBSBSSSBSSSBSSBBBSBSS":
             return "👑 Mr King"
         elif pattern == "SBSSSBBBBBSSBBSSSBBSSSBSSBBBSBBSSBSSBSBSBSSSBBSBSSSSSBBBSBBSBBBSBSBBBBSBSSBBSSSBBBSSBSBSBBBBSBS":
@@ -186,10 +181,12 @@ def get_strategy_display_name(settings: dict) -> str:
         elif pattern == "BSSBSSBSBBSBSBSBBSBSBBSSBBSBSBBSBSBBSBBSBBBSBSSSBBBBB":
             return "⭐ KM_Enhance"
         else:
+            # Manual pattern - show as Manual
             return "📝 Manual BS"
     return "Unknown"
 
 def apply_formula_mode(ch: str, formula_mode: str, last_result: str = None) -> str:
+    """Apply formula mode to the prediction"""
     if formula_mode == "straight":
         return ch
     elif formula_mode == "reverse":
@@ -521,16 +518,47 @@ async def win_lose_checker(context: ContextTypes.DEFAULT_TYPE):
                                     
                                     current_balance = await get_user_balance(session, user_id)
                                     
+                                    skip_betting_status = "SL" if settings.get("skip_betting", False) else ""
+                                    original_index_info = f" (Was at index {original_bet_index+1}: {bet_sizes[original_bet_index] if original_bet_index < len(bet_sizes) else 'N/A'} MMK)" if settings.get("skip_betting", False) and is_win else ""
+                                    
                                     if amount > 0:
                                         if is_win:
-                                            result_text = (f"✅ WIN + {amount * 1.96:.0f} Ks\n📌 {period} = {big_small} (Number: {number_str})\n💰 Balance: {current_balance:,.0f} Ks\n📈 Total Profit: {user_stats[user_id]['profit']:,.0f} Ks\n✅ Win Count: {user_stats[user_id].get('win_count', 0)}\n🔄 Next Bet: {bet_sizes[settings['bet_index']] if bet_sizes else 0} MMK\n📉 Consecutive Losses: {settings.get('consecutive_losses', 0)}")
+                                            result_text = (
+                                                f"✅ အနိုင် + {amount * 1.96:.0f} Ks{skip_betting_status}{original_index_info}\n"
+                                                f"📌 {period} = {big_small} (နံပါတ်: {number_str})\n"
+                                                f"💰 လက်ကျန်: {current_balance:,.0f} Ks\n"
+                                                f"📈 စုစုပေါင်းအမြတ်: {user_stats[user_id]['profit']:,.0f} Ks\n"
+                                                f"✅ အနိုင်အရေအတွက်: {user_stats[user_id].get('win_count', 0)}\n"
+                                                f"🔄 နောက်ထိုးကြေး: {bet_sizes[settings['bet_index']] if bet_sizes else 0} MMK (အဆင့်: {settings['bet_index']+1})\n"
+                                                f"📉 ဆက်တိုက်ရှုံး: {settings.get('consecutive_losses', 0)}"
+                                            )
                                         else:
-                                            result_text = (f"❌ LOSS - {amount:.0f} Ks\n📌 {period} = {big_small} (Number: {number_str})\n💰 Balance: {current_balance:,.0f} Ks\n📉 Total Profit: {user_stats[user_id]['profit']:,.0f} Ks\n🔄 Next Bet: {bet_sizes[settings['bet_index']] if bet_sizes else 0} MMK\n📉 Consecutive Losses: {settings.get('consecutive_losses', 0)}")
+                                            result_text = (
+                                                f"❌ ရှုံး - {amount:.0f} Ks{skip_betting_status}\n"
+                                                f"📌 {period} = {big_small} (နံပါတ်: {number_str})\n"
+                                                f"💰 လက်ကျန်: {current_balance:,.0f} Ks\n"
+                                                f"📉 စုစုပေါင်းအမြတ်: {user_stats[user_id]['profit']:,.0f} Ks\n"
+                                                f"🔄 နောက်ထိုးကြေး: {bet_sizes[settings['bet_index']] if bet_sizes else 0} MMK (အဆင့်: {settings['bet_index']+1})\n"
+                                                f"📉 ဆက်တိုက်ရှုံး: {settings.get('consecutive_losses', 0)}"
+                                            )
                                     else:
                                         if is_win:
-                                            result_text = (f"🎯 FREE WIN\n📌 {period} = {big_small} (Number: {number_str})\n💰 Balance: {current_balance:,.0f} Ks\n📈 Total Profit: {user_stats[user_id]['profit']:,.0f} Ks\n🔄 Next Bet: {bet_sizes[settings['bet_index']] if bet_sizes else 0} MMK\n📉 Consecutive Losses: {settings.get('consecutive_losses', 0)}")
+                                            result_text = (
+                                                f"🎯 အခမဲ့အနိုင်{skip_betting_status}{original_index_info}\n"
+                                                f"📌 {period} = {big_small} (နံပါတ်: {number_str})\n"
+                                                f"💰 လက်ကျန်: {current_balance:,.0f} Ks\n"
+                                                f"📈 စုစုပေါင်းအမြတ်: {user_stats[user_id]['profit']:,.0f} Ks\n"
+                                                f"🔄 နောက်ထိုးကြေး: {bet_sizes[settings['bet_index']] if bet_sizes else 0} MMK (အဆင့်: {settings['bet_index']+1})\n"
+                                                f"📉 ဆက်တိုက်ရှုံး: {settings.get('consecutive_losses', 0)}"
+                                            )
                                         else:
-                                            result_text = (f"📌 {period} = {big_small} (Number: {number_str})\n💰 Balance: {current_balance:,.0f} Ks\n📈 Total Profit: {user_stats[user_id]['profit']:,.0f} Ks\n🔄 Next Bet: {bet_sizes[settings['bet_index']] if bet_sizes else 0} MMK\n📉 Consecutive Losses: {settings.get('consecutive_losses', 0)}")
+                                            result_text = (
+                                                f"📌 {period} = {big_small} (နံပါတ်: {number_str}){skip_betting_status}\n"
+                                                f"💰 လက်ကျန်: {current_balance:,.0f} Ks\n"
+                                                f"📈 စုစုပေါင်းအမြတ်: {user_stats[user_id]['profit']:,.0f} Ks\n"
+                                                f"🔄 နောက်ထိုးကြေး: {bet_sizes[settings['bet_index']] if bet_sizes else 0} MMK (အဆင့်: {settings['bet_index']+1})\n"
+                                                f"📉 ဆက်တိုက်ရှုံး: {settings.get('consecutive_losses', 0)}"
+                                            )
                                     
                                     await send_message_with_retry(context.bot, user_id, result_text)
                                     
@@ -539,10 +567,10 @@ async def win_lose_checker(context: ContextTypes.DEFAULT_TYPE):
                                     if user_id in user_stats:
                                         current_profit = user_stats[user_id]["profit"]
                                         if target_profit and current_profit >= target_profit:
-                                            await send_message_with_retry(context.bot, user_id, f"🎉 Target Profit Reached! 🎉\nBot stopped! Profit: {current_profit:.0f} Ks")
+                                            await send_message_with_retry(context.bot, user_id, f"🎉 အမြတ်ပစ်မှတ်ပြည့်သွားပါပြီ! 🎉\nBot ရပ်လိုက်ပါပြီ! အမြတ်: {current_profit:.0f} Ks")
                                             settings["running"] = False
                                         elif stop_loss and current_profit <= -stop_loss:
-                                            await send_message_with_retry(context.bot, user_id, f"🚨 Stop Loss Hit! 🚨\nLoss: {-current_profit:.0f} Ks (Limit: {stop_loss:.0f} Ks)\nBot stopped!")
+                                            await send_message_with_retry(context.bot, user_id, f"🚨 အရှုံးကန့်သတ်ချက်ထိသွားပါပြီ! 🚨\nအရှုံး: {-current_profit:.0f} Ks (ကန့်သတ်: {stop_loss:.0f} Ks)\nBot ရပ်လိုက်ပါပြီ!")
                                             settings["running"] = False
                                     
                                     settings["last_result"] = big_small
@@ -571,7 +599,7 @@ async def win_lose_checker(context: ContextTypes.DEFAULT_TYPE):
                                         settings["consecutive_losses"] = 0
                                         settings["skip_betting"] = False
                                         
-                                        await send_message_with_retry(context.bot, user_id, f"⏰ Timeout waiting for result for period {period}.\nBet cleared. Resetting bet sequence...")
+                                        await send_message_with_retry(context.bot, user_id, f"⏰ အချိန်ကုန်သွားပါပြီ {period} အတွက် ရလဒ်စောင့်ဆိုင်းရာတွင်။\nလောင်းကြေးရှင်းလင်းပြီးပါပြီ။ ထိုးစဉ်ကို ပြန်လည်စတင်နေပါပြီ...")
                 
                 except Exception as e:
                     logging.error(f"Error in win/lose checker for user {user_id}: {e}")
@@ -588,7 +616,7 @@ async def betting_worker(user_id: int, chat_id: int, app_context: ContextTypes.D
     session = user_sessions.get(user_id)
     if not settings or not session:
         logging.error(f"Betting worker failed for user {user_id}: No settings or session")
-        await send_message_with_retry(app_context.bot, chat_id, "Please login first")
+        await send_message_with_retry(app_context.bot, chat_id, "ကျေးဇူးပြု၍ ဦးစွာဝင်ရောက်ပါ")
         if settings:
             settings["running"] = False
         return
@@ -611,12 +639,12 @@ async def betting_worker(user_id: int, chat_id: int, app_context: ContextTypes.D
         logging.warning(f"Initial balance check failed for user {user_id}, attempt {attempt + 1}/{MAX_BALANCE_RETRIES}")
         if attempt == MAX_BALANCE_RETRIES - 1:
             logging.error(f"Failed to get initial balance for user {user_id} after {MAX_BALANCE_RETRIES} attempts")
-            await send_message_with_retry(app_context.bot, chat_id, "Failed to check balance. Stopping...")
+            await send_message_with_retry(app_context.bot, chat_id, "လက်ကျန်ငွေ စစ်ဆေးမရပါ။ ရပ်နားနေပါသည်...")
             settings["running"] = False
             return
         await asyncio.sleep(BALANCE_RETRY_DELAY)
     
-    await send_message_with_retry(app_context.bot, chat_id, f"✅ BOT IS STARTING NOW!\nBalance: {current_balance:.2f} MMK")
+    await send_message_with_retry(app_context.bot, chat_id, f"✅ BOT စတင်လုပ်ဆောင်ပါပြီ!\nလက်ကျန်: {current_balance:.2f} MMK")
     logging.info(f"Betting worker started for user {user_id}, settings: {settings}")
     
     try:
@@ -647,7 +675,7 @@ async def betting_worker(user_id: int, chat_id: int, app_context: ContextTypes.D
                 
                 if current_balance is None:
                     logging.error(f"Cannot get balance for user {user_id}")
-                    await send_message_with_retry(app_context.bot, chat_id, "Cannot check balance. Stopping...")
+                    await send_message_with_retry(app_context.bot, chat_id, "လက်ကျန်ငွေ စစ်ဆေးမရပါ။ ရပ်နားနေပါသည်...")
                     settings["running"] = False
                     break
                 
@@ -659,7 +687,7 @@ async def betting_worker(user_id: int, chat_id: int, app_context: ContextTypes.D
                     settings["consecutive_errors"] = settings.get("consecutive_errors", 0) + 1
                     if settings["consecutive_errors"] >= MAX_CONSECUTIVE_ERRORS:
                         logging.error(f"Max consecutive errors ({MAX_CONSECUTIVE_ERRORS}) reached for user {user_id}. Stopping bot.")
-                        await send_message_with_retry(app_context.bot, chat_id, f"Too many consecutive errors ({MAX_CONSECUTIVE_ERRORS}). Stopping bot.")
+                        await send_message_with_retry(app_context.bot, chat_id, f"ဆက်တိုက်အမှားများလွန်းပါသည် ({MAX_CONSECUTIVE_ERRORS})။ Bot ရပ်နားနေပါသည်။")
                         settings["running"] = False
                         break
                     await asyncio.sleep(2)
@@ -719,7 +747,7 @@ async def betting_worker(user_id: int, chat_id: int, app_context: ContextTypes.D
                     pattern = settings.get("pattern")
                     if not pattern:
                         logging.error(f"No bet order set for user {user_id}")
-                        await send_message_with_retry(app_context.bot, chat_id, "No bet order set. Stopping.")
+                        await send_message_with_retry(app_context.bot, chat_id, "ထိုးစဉ်မရှိပါ။ ရပ်နားနေပါသည်။")
                         settings["running"] = False
                         break
                     pidx = settings.get("pattern_index", 0) % len(pattern)
@@ -730,11 +758,11 @@ async def betting_worker(user_id: int, chat_id: int, app_context: ContextTypes.D
                 select_type = get_select_map(game_type).get(ch)
                 if select_type is None:
                     logging.error(f"Invalid bet type {ch} for user {user_id}")
-                    await send_message_with_retry(app_context.bot, chat_id, f"Invalid bet type: {ch}. Retrying...")
+                    await send_message_with_retry(app_context.bot, chat_id, f"မှားယွင်းသောထိုးအမျိုးအစား: {ch}. ပြန်လည်ကြိုးစားနေပါသည်...")
                     settings["consecutive_errors"] += 1
                     if settings["consecutive_errors"] >= MAX_CONSECUTIVE_ERRORS:
                         logging.error(f"Max consecutive errors ({MAX_CONSECUTIVE_ERRORS}) reached for user {user_id}. Stopping bot.")
-                        await send_message_with_retry(app_context.bot, chat_id, f"Too many consecutive errors ({MAX_CONSECUTIVE_ERRORS}). Stopping bot.")
+                        await send_message_with_retry(app_context.bot, chat_id, f"ဆက်တိုက်အမှားများလွန်းပါသည် ({MAX_CONSECUTIVE_ERRORS})။ Bot ရပ်နားနေပါသည်။")
                         settings["running"] = False
                         break
                     await asyncio.sleep(2)
@@ -743,7 +771,7 @@ async def betting_worker(user_id: int, chat_id: int, app_context: ContextTypes.D
                 bet_sizes = settings.get("bet_sizes", [100])
                 if not bet_sizes:
                     logging.error(f"No bet sizes set for user {user_id}")
-                    await send_message_with_retry(app_context.bot, chat_id, "No bet sizes set. Please set BET SEQUENCE first.")
+                    await send_message_with_retry(app_context.bot, chat_id, "ထိုးကြေးအဆင့်များ မရှိပါ။ ကျေးဇူးပြု၍ ထိုးကြေးအဆင့်များ ဦးစွာသတ်မှတ်ပါ။")
                     settings["running"] = False
                     break
                 
@@ -762,7 +790,7 @@ async def betting_worker(user_id: int, chat_id: int, app_context: ContextTypes.D
                 
                 if not is_free_bet and current_balance < amount:
                     logging.error(f"Insufficient balance for user {user_id}: {current_balance} < {amount}")
-                    await send_message_with_retry(app_context.bot, chat_id, f"Not enough balance!\nCurrent: {current_balance:.2f} MMK\nNeeded: {amount:.2f} MMK\nStopping...")
+                    await send_message_with_retry(app_context.bot, chat_id, f"လက်ကျန်ငွေ မလုံလောက်ပါ!\nလက်ရှိ: {current_balance:.2f} MMK\nလိုအပ်: {amount:.2f} MMK\nရပ်နားနေပါသည်...")
                     settings["running"] = False
                     break
                 
@@ -780,13 +808,13 @@ async def betting_worker(user_id: int, chat_id: int, app_context: ContextTypes.D
                 sl_indicator = "SL" if skip_betting else ""
                 
                 bet_msg = (
-                    f"🪷 K RAW LOTTERY SUPER BOT\n\n"
-                    f"🎲 Bet {'Big' if ch == 'B' else 'Small'} ({ch}) {amount:.0f} MMK{formula_indicator}{sl_indicator}\n"
-                    f"📊 Bet Sequence: {settings.get('bet_index', 0) + 1}/{len(bet_sizes)} {'🆓' if is_free_bet else '💰'}\n"
-                    f"📉 Consecutive Losses: {settings.get('consecutive_losses', 0)}\n"
+                    f"🪷 𝐋𝐨𝐭𝐮𝐬 𝐒𝐮𝐩𝐞𝐫 𝐁𝐨𝐭 𝟔 𝐋𝐨𝐭𝐭𝐞𝐫𝐲\n\n"
+                    f"🎲 ထိုးချက် {'Big' if ch == 'B' else 'Small'} ({ch}) {amount:.0f} MMK{formula_indicator}{sl_indicator}\n"
+                    f"📊 ထိုးကြေးအစဉ်: {settings.get('bet_index', 0) + 1}/{len(bet_sizes)} {'🆓' if is_free_bet else '💰'}\n"
+                    f"📉 ဆက်တိုက်ရှုံး: {settings.get('consecutive_losses', 0)}\n"
                     f"---------------------------\n"
                     f"{'TRX' if game_type == 'TRX' else 'WG'}   : {current_issue}\n"
-                    f"Status: Bet success {current_time}"
+                    f"အခြေအနေ: ထိုးပြီးပါပြီ {current_time}"
                 )
                 
                 await send_message_with_retry(app_context.bot, chat_id, bet_msg)
@@ -799,31 +827,31 @@ async def betting_worker(user_id: int, chat_id: int, app_context: ContextTypes.D
                     
                     if isinstance(bet_resp, dict) and bet_resp.get("error"):
                         logging.error(f"Bet error for user {user_id}, game_type {game_type}, issue {current_issue}: {bet_resp.get('error')}")
-                        await send_message_with_retry(app_context.bot, chat_id, f"Bet error: {bet_resp.get('error')}. Retrying next cycle...")
+                        await send_message_with_retry(app_context.bot, chat_id, f"ထိုးရာတွင် အမှား: {bet_resp.get('error')}. နောက်အကြိမ်ပြန်လည်ကြိုးစားနေပါသည်...")
                         settings["consecutive_errors"] += 1
                         if settings["consecutive_errors"] >= MAX_CONSECUTIVE_ERRORS:
                             logging.error(f"Max consecutive errors ({MAX_CONSECUTIVE_ERRORS}) reached for user {user_id}. Stopping bot.")
-                            await send_message_with_retry(app_context.bot, chat_id, f"Too many consecutive errors ({MAX_CONSECUTIVE_ERRORS}). Stopping bot.")
+                            await send_message_with_retry(app_context.bot, chat_id, f"ဆက်တိုက်အမှားများလွန်းပါသည် ({MAX_CONSECUTIVE_ERRORS})။ Bot ရပ်နားနေပါသည်။")
                             settings["running"] = False
                             break
                         await asyncio.sleep(5)
                         continue
                     elif isinstance(bet_resp, dict) and bet_resp.get("code") != 0:
-                        error_msg = bet_resp.get("msg", "Unknown error")
+                        error_msg = bet_resp.get("msg", "အမည်မသိအမှား")
                         logging.error(f"API error for user {user_id}, game_type {game_type}, issue {current_issue}: {error_msg}")
-                        await send_message_with_retry(app_context.bot, chat_id, f"API error: {error_msg}. Retrying next cycle...")
+                        await send_message_with_retry(app_context.bot, chat_id, f"API အမှား: {error_msg}. နောက်အကြိမ်ပြန်လည်ကြိုးစားနေပါသည်...")
                         if "settled" not in error_msg.lower():
                             settings["consecutive_errors"] += 1
                         if settings["consecutive_errors"] >= MAX_CONSECUTIVE_ERRORS:
                             logging.error(f"Max consecutive errors ({MAX_CONSECUTIVE_ERRORS}) reached for user {user_id}. Stopping bot.")
-                            await send_message_with_retry(app_context.bot, chat_id, f"Too many consecutive errors ({MAX_CONSECUTIVE_ERRORS}). Stopping bot.")
+                            await send_message_with_retry(app_context.bot, chat_id, f"ဆက်တိုက်အမှားများလွန်းပါသည် ({MAX_CONSECUTIVE_ERRORS})။ Bot ရပ်နားနေပါသည်။")
                             settings["running"] = False
                             break
                         await asyncio.sleep(5)
                         continue
                     settings["consecutive_errors"] = 0
                 else:
-                    bet_resp = {"code": 0, "msg": "Free bet placed successfully"}
+                    bet_resp = {"code": 0, "msg": "အခမဲ့ထိုးခြင်း အောင်မြင်ပါသည်"}
                     settings["last_issue"] = current_issue
                 
                 if user_id not in user_pending_bets:
@@ -851,7 +879,7 @@ async def betting_worker(user_id: int, chat_id: int, app_context: ContextTypes.D
                 
                 if settings["consecutive_errors"] >= MAX_CONSECUTIVE_ERRORS:
                     settings["running"] = False
-                    await send_message_with_retry(app_context.bot, chat_id, f"Too many errors: {str(e)}. Bot stopped.")
+                    await send_message_with_retry(app_context.bot, chat_id, f"အမှားများလွန်းပါသည်: {str(e)}. Bot ရပ်နားပါသည်။")
                     break
                 
                 await asyncio.sleep(5)
@@ -860,7 +888,7 @@ async def betting_worker(user_id: int, chat_id: int, app_context: ContextTypes.D
         logging.info(f"Betting worker cancelled for user {user_id}")
     except Exception as e:
         logging.error(f"Betting worker fatal error for user {user_id}: {e}")
-        await send_message_with_retry(app_context.bot, chat_id, f"Fatal error: {str(e)}. Bot stopped.")
+        await send_message_with_retry(app_context.bot, chat_id, f"အဆိုးရွားဆုံးအမှား: {str(e)}. Bot ရပ်နားပါသည်။")
     finally:
         settings["running"] = False
         user_waiting_for_result.pop(user_id, None)
@@ -869,34 +897,36 @@ async def betting_worker(user_id: int, chat_id: int, app_context: ContextTypes.D
         
         session = user_sessions.get(user_id)
         current_balance = await get_user_balance(session, user_id) if session else None
-        balance_text = f"💰 Balance: {current_balance:,.0f} Ks\n" if current_balance is not None else ""
-        profit_text = f"📈 Total Profit: {user_stats.get(user_id, {}).get('profit', 0):,.0f} Ks\n" if user_id in user_stats else ""
+        balance_text = f"💰 လက်ကျန်: {current_balance:,.0f} Ks\n" if current_balance is not None else ""
+        profit_text = f"📈 စုစုပေါင်းအမြတ်: {user_stats.get(user_id, {}).get('profit', 0):,.0f} Ks\n" if user_id in user_stats else ""
         
         await send_message_with_retry(app_context.bot, chat_id,
-                                     f"🛑 Bot Stopped!\n{balance_text}{profit_text}",
+                                     f"🛑 Bot ရပ်နားပါပြီ!\n{balance_text}{profit_text}",
                                      reply_markup=make_main_keyboard(logged_in=True))
 
 def make_main_keyboard(logged_in: bool = False):
     if not logged_in:
-        return ReplyKeyboardMarkup([["🔐 Login"]], resize_keyboard=True, one_time_keyboard=False)
+        return ReplyKeyboardMarkup([["🔐 ဝင်ရောက်မယ်"]], resize_keyboard=True, one_time_keyboard=False)
     return ReplyKeyboardMarkup(
         [
-            ["🔐 Login", "✅ Start", "⛔ Stop"],
-            ["🎮 Choose Game", "💵 Bet Sequence"],
-            ["🧠 Change Strategy"],
-            ["🚨 SL Limit", "🎯 Profit Target"],
-            ["⛔ Stop Loss", "💰 Check Balance"],
-            ["🖨️ Check Info"]
+            ["🔐 ဝင်ရောက်မယ်", "✅ စတင်မယ်", "⛔ ရပ်မယ်"],
+            ["🎮 ဂိမ်းရွေးမယ်", "💵 ထိုးကြေးအဆင့်များ"],
+            ["📝 Manual BS", "🧠 နည်းဗျူဟာပြောင်းမယ်"],
+            ["🚨 SL ကန့်သတ်ချက်", "🎯 အမြတ်ပစ်မှတ်"],
+            ["⛔အရှုံးကန့်သတ်ချက်⛔", "💰လက်ကျန်ငွေ💰"],
+            ["🖨️ အချက်အလက်စစ်မယ်", "⭐KM_Enhance⭐"],
+            ["🎲 ဖော်မြူလာ ဖလှယ်ရေး"],
+            ["🖨️ ဆက်တင်အချက်အလက် ကူးယူမယ် 🖨️"]
         ],
         resize_keyboard=True, one_time_keyboard=False
     )
 
 def make_platform_keyboard():
     return ReplyKeyboardMarkup([
-        ["🔴 6lottery"],
-        ["🔵 Cklottery"],
-        ["🟢 777bigwin"],
-        ["🔙 Back to Main Menu"]
+        ["6lottery"],
+        ["Cklottery"],
+        ["777bigwingame"],
+        ["🔙 ပင်မမီနူး"]
     ], resize_keyboard=True)
 
 def make_strategy_keyboard():
@@ -904,13 +934,52 @@ def make_strategy_keyboard():
         ["👑 Mr King", "💎 V 1", "🎰 Lottery Father"],
         ["🤖 AI WAVE", "🤖 AI King", "🤖 AI Chat"],
         ["📈 Lottery Follow", "🧠 Lottery Brain", "⭐ KM_Enhance"],
-        ["🔙 Back to Main Menu"]
+        ["🔙 ပင်မမီနူး"]
     ], resize_keyboard=True)
+
+def make_betting_strategy_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Anti-Martingale", callback_data="betting_strategy:Anti-Martingale")],
+        [InlineKeyboardButton("Martingale", callback_data="betting_strategy:Martingale")],
+        [InlineKeyboardButton("D'Alembert", callback_data="betting_strategy:D'Alembert")]
+    ])
+
+def make_formula_exchange_keyboard():
+    return ReplyKeyboardMarkup([
+        ["🛞 Straight", "🧭 Reverse"],
+        ["🤑 BACK Formula"],
+    ], resize_keyboard=True)
+
+async def formula_exchange_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await send_message_with_retry(context.bot, update.effective_chat.id, 
+                                 "ဖော်မြူလာမုဒ် ရွေးချယ်ပါ:", reply_markup=make_formula_exchange_keyboard())
+
+async def straight_formula_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_settings[user_id]["formula_mode"] = "straight"
+    await send_message_with_retry(context.bot, update.effective_chat.id, 
+                                 "🛞 Straight ဖော်မြူလာမုဒ် ✓",
+                                 reply_markup=make_main_keyboard(logged_in=True))
+
+async def reverse_formula_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_settings[user_id]["formula_mode"] = "reverse"
+    await send_message_with_retry(context.bot, update.effective_chat.id, 
+                                 "🧭 Reverse ဖော်မြူလာမုဒ် ✓",
+                                 reply_markup=make_main_keyboard(logged_in=True))
+
+async def back_formula_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_settings[user_id]["formula_mode"] = "back"
+    await send_message_with_retry(context.bot, update.effective_chat.id, 
+                                 "🤑 BACK ဖော်မြူလာမုဒ် ✓",
+                                 reply_markup=make_main_keyboard(logged_in=True))
 
 async def account_balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in user_sessions:
-        await send_message_with_retry(context.bot, update.effective_chat.id, "Please login first", reply_markup=make_main_keyboard(logged_in=False))
+        await send_message_with_retry(context.bot, update.effective_chat.id, "ကျေးဇူးပြု၍ ဦးစွာဝင်ရောက်ပါ", reply_markup=make_main_keyboard(logged_in=False))
         return
     
     session = user_sessions[user_id]
@@ -926,11 +995,11 @@ async def account_balance_handler(update: Update, context: ContextTypes.DEFAULT_
     platform = settings.get("platform", "Unknown")
     
     balance_text = (
-        f"⏰ Time: {current_time}\n"
-        f"🎮 Game: {game_type}\n"
-        f"💰 Balance: {balance:,.2f} MMK\n"
+        f"⏰ အချိန်: {current_time}\n"
+        f"🎮 ဂိမ်း: {game_type}\n"
+        f"💰 လက်ကျန်: {balance:,.2f} MMK\n"
         f"🆔 ID: {user_info.get('user_id', 'N/A')}\n"
-        f"🏛️ Platform: {platform}"
+        f"🏛️ ပလက်ဖောင်း: {platform}"
     )
     
     await send_message_with_retry(context.bot, update.effective_chat.id, balance_text, reply_markup=make_main_keyboard(logged_in=True))
@@ -945,13 +1014,13 @@ async def km_enhance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_settings[user_id]["pattern_type"] = "sequential"
     
     await send_message_with_retry(context.bot, update.effective_chat.id, 
-                                 f"✅ KM_Enhance pattern set:\n{pattern}",
+                                 f"✅ KM_Enhance နည်းဗျူဟာ သတ်မှတ်ပြီးပါပြီ:\n{pattern}",
                                  reply_markup=make_main_keyboard(logged_in=True))
 
 async def check_user_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
     if user_id not in user_sessions:
-        await send_message_with_retry(context.bot, update.effective_chat.id, "Please login first", reply_markup=make_main_keyboard(logged_in=False))
+        await send_message_with_retry(context.bot, update.effective_chat.id, "ကျေးဇူးပြု၍ ဦးစွာဝင်ရောက်ပါ", reply_markup=make_main_keyboard(logged_in=False))
         return False
     if user_id not in user_settings:
         user_settings[user_id] = {
@@ -971,7 +1040,7 @@ async def check_user_authorized(update: Update, context: ContextTypes.DEFAULT_TY
             "bet_index": 0,
             "original_bet_index": 0
         }
-        logging.info(f"Initialized user_settings for user {user_id}")
+        logging.info(f"ဆက်တင်များ စတင်သတ်မှတ်ပြီးပါပြီ အသုံးပြုသူ {user_id} အတွက်")
     return True
     
 def get_strategy_by_display_name(display_name: str) -> Optional[dict]:
@@ -995,7 +1064,7 @@ def get_strategy_by_display_name(display_name: str) -> Optional[dict]:
     elif strategy_key == "AI WAVE":
         return {"pattern_type": "sequential", "pattern": "SSBBSSSSSBSSBBBBSBSSBSSBSBBSSBBBSBSSSBSSSSBBSSSSSBSSBBBBSBSSBSSBSBBSSBBBSBSSSBSSSSBBSSSSSBSSBBBBSBSS"}
     elif strategy_key == "AI King":
-        return {"pattern_type": "sequential", "pattern": "SSBBSSSSSBSSBBSSBSSBBBBSBSS"}
+        return {"pattern_type": "sequential", "pattern": "SSBBSSSSSBSSBBBBSBSSBSSBSBBSSBBBSBSSSBSSSBBSSSSSBSSBBBBSBSS"}
     elif strategy_key == "AI Chat":
         return {"pattern_type": "sequential", "pattern": "BSBBSBBSBSSSBBSSSSSBSSBBBBSBSSBSSBSBBSSBBBSBSSSBSSSSBBSSSSSBSSBBBBSBSSBSSBSBBSSBBBSBSSSBSSSSBBSSSSSBSSBBBBSBSSBSBSBSBSBSBBSSBSSBBSBSSBBSBBSSBBBSSSSSBBSBBSSBSSBBBSBSSSBSBBSSBSBBBSBBBBSSSSSBBSBSSSBSBBBBBSBSSSBSBSSBSSBBSBBBSSSSSBBBBBSBBBSBSSSBBBBBSSSSSBSSSSSBBBBBBSSSSSBBSBSBSBSBSBBBBSSSSSBSSBBSBBSSBBSBSSSBSBBSBBSSBSSBBBBSSSSSBBBBSSBSBBBSBBSSBSSBBSBSBSSSBSBBBBBSBSSSBSBSSBSSBBSBBBSBBSSBSSBSBBBSBSSSBBBBBSSSSSBSSSSSBBBBBBSSSSSBBBBBSBSBSBSBSBBBBSSSSSBSSBBSBBSSBBSBSSSBSBBSBBSSBSSBSBSSBSSBSBBBSSBBBBBSBBSSSSBSBBSBBSBSSBBSSSBSBBBSBBBBSSBBBBBSBBSSSBBBSBBBSBBBSBBBSBBSSBSSSBBSSBBSSBBBSBBBSBBBSBBBBBSSSSSSBBSSSSBSBSSSSBBSSSSBBSSSSSBSSSSBSBBBSBBBSBBSSBBBSBBBSBBBSBBBSBBSBSBSBSBSBSBBSSBSSBBSBSSBBSBBSSBBBSSSSSBBSBBSSBSSBBBSBSSSBSBBSSBSBBBSBBBBSSSSSBBSBSSSBSBBBBBSBSSSBSBSSBSSBBSBBBSSSSSBBBBBSBBBSBSSSBBBBBSSSSSBSSSSSBBBBBBSSSSSBBSBSBSBSBSBBBBSSSSSBSSBBSBBSSBBSBSSSBSBBSBBSSBSSBBBBSSSSSBBBBSSBSBBBSBBSSBSSBBSBSBSSSBSBBBBBSBSSSBSBSSBSSBBSBBBSBBSSBSSBSBBBSBSSSBBBBBSSSSSBSSSSSBBBBBBSSSSSBBBBBSBSBSBSBSBBBBSSSSSBSSBBSBBSSBBSBSSSBSBBSBBSSBSSB"}
     elif strategy_key == "KM_Enhance":
@@ -1025,15 +1094,15 @@ async def cmd_start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "bet_index": 0,
             "original_bet_index": 0
         }
-        logging.info(f"Initialized user_settings for user {user_id} in cmd_start_handler")
+        logging.info(f"ဆက်တင်များ စတင်သတ်မှတ်ပြီးပါပြီ အသုံးပြုသူ {user_id} အတွက်")
     logged_in = user_id in user_sessions
     
     welcome_message = (
-        "🌟 Hello Welcome ALL USER\n\n"
+        "🌟 မင်္ဂလာပါ ကြိုဆိုပါတယ်\n\n"
         "🪷 K RAW LOTTERY SUPER BOT\n\n"
         "🎰 LOTTERY (B,S) AUTO BET BOT\n\n"
         "────────────────────\n"
-        "📌 ADMIN 🖇️ @Ruth83Mee\n"
+        "📌 ADMIN 🖇️ @RAW1113\n"
         "🎰 REGISTER LINK\n"
         "🖇️ https://www.777bigwingame.vip/#/register?invitationCode=52651649234\n"
         "🖇 http://www.cklottery.tv/#/register?invitationCode=52585635882\n"
@@ -1049,31 +1118,48 @@ async def cmd_start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_allow_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
-        await send_message_with_retry(context.bot, update.effective_chat.id, "Admin only!")
+        await send_message_with_retry(context.bot, update.effective_chat.id, "အကြီးအကဲမှသာလျှင် အသုံးပြုနိုင်သည်!")
         return
     if not context.args or not context.args[0].isdigit():
-        await send_message_with_retry(context.bot, update.effective_chat.id, "Usage: /allow {in-game-user-id}")
+        await send_message_with_retry(context.bot, update.effective_chat.id, "အသုံးပြုပုံ: /allow {777bigwin_id}")
         return
-    ingame_id = int(context.args[0])
-    allowed_user_ids[str(ingame_id)] = {"ingame_id": ingame_id, "allowed_by": ADMIN_ID, "time": time.time()}
-    save_allowed_users()
-    await send_message_with_retry(context.bot, update.effective_chat.id, f"✅ User in-game ID {ingame_id} has been authorized")
+    bigwin_id = int(context.args[0])
+    if bigwin_id in allowed_777bigwin_ids:
+        await send_message_with_retry(context.bot, update.effective_chat.id, f"အသုံးပြုသူ {bigwin_id} ပြီးသားရှိပါသည်")
+    else:
+        allowed_777bigwin_ids.add(bigwin_id)
+        save_allowed_users()
+        await send_message_with_retry(context.bot, update.effective_chat.id, f"အသုံးပြုသူ {bigwin_id} ကို ခွင့်ပြုလိုက်ပါပြီ")
 
 async def cmd_remove_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
-        await send_message_with_retry(context.bot, update.effective_chat.id, "Admin only!")
+        await send_message_with_retry(context.bot, update.effective_chat.id, "အကြီးအကဲမှသာလျှင် အသုံးပြုနိုင်သည်!")
         return
     if not context.args or not context.args[0].isdigit():
-        await send_message_with_retry(context.bot, update.effective_chat.id, "Usage: /remove {in-game-user-id}")
+        await send_message_with_retry(context.bot, update.effective_chat.id, "အသုံးပြုပုံ: /remove {777bigwin_id}")
         return
-    ingame_id = int(context.args[0])
-    if str(ingame_id) not in allowed_user_ids:
-        await send_message_with_retry(context.bot, update.effective_chat.id, f"User in-game ID {ingame_id} not found")
+    bigwin_id = int(context.args[0])
+    if bigwin_id not in allowed_777bigwin_ids:
+        await send_message_with_retry(context.bot, update.effective_chat.id, f"အသုံးပြုသူ {bigwin_id} အား ရှာမတွေ့ပါ")
     else:
-        del allowed_user_ids[str(ingame_id)]
+        allowed_777bigwin_ids.remove(bigwin_id)
         save_allowed_users()
-        await send_message_with_retry(context.bot, update.effective_chat.id, f"❌ User in-game ID {ingame_id} has been removed")
+        await send_message_with_retry(context.bot, update.effective_chat.id, f"အသုံးပြုသူ {bigwin_id} အား ဖယ်ရှားလိုက်ပါပြီ")
+
+async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    if not await check_user_authorized(update, context):
+        return
+    
+    if query.data.startswith("betting_strategy:"):
+        betting_strategy = query.data.split(":")[1]
+        user_settings[user_id]["betting_strategy"] = betting_strategy
+        await send_message_with_retry(context.bot, query.message.chat_id, f"Betting Strategy သတ်မှတ်ပြီးပါပြီ: {betting_strategy}", reply_markup=make_main_keyboard(logged_in=True))
+        await query.message.delete()
 
 async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1086,44 +1172,38 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     logging.info(f"Parsed lines by user {user_id} (count: {len(lines)}): {lines}")
     logging.info(f"Current state for user {user_id}: {user_state.get(user_id, 'None')}")
 
-    if text == "🔐 Login":
+    if text == "🔐 ဝင်ရောက်မယ်":
         if user_id not in user_sessions:
             user_state[user_id] = {"state": "WAIT_PLATFORM"}
-            await send_message_with_retry(context.bot, update.effective_chat.id, "🟢 Choose Your Platform", reply_markup=make_platform_keyboard())
+            await send_message_with_retry(context.bot, update.effective_chat.id, "🟢 သင့်ပလက်ဖောင်းကို ရွေးချယ်ပါ", reply_markup=make_platform_keyboard())
             return
         else:
-            await send_message_with_retry(context.bot, update.effective_chat.id, "You are already logged in!", reply_markup=make_main_keyboard(logged_in=True))
+            await send_message_with_retry(context.bot, update.effective_chat.id, "သင်သည် ဝင်ရောက်ပြီးသားဖြစ်သည်!", reply_markup=make_main_keyboard(logged_in=True))
             return
     
     if user_state.get(user_id, {}).get("state") == "WAIT_PLATFORM":
-        selected_platform = None
-        for platform_key in PLATFORM_URLS.keys():
-            if PLATFORM_NAMES[platform_key] == text:
-                selected_platform = platform_key
-                break
-        
-        if selected_platform:
-            user_temp[user_id] = {"platform": selected_platform, "base_url": PLATFORM_URLS[selected_platform]}
+        if text in PLATFORM_URLS:
+            user_temp[user_id] = {"platform": text, "base_url": PLATFORM_URLS[text]}
             user_state[user_id] = {"state": "WAIT_PHONE"}
-            await send_message_with_retry(context.bot, update.effective_chat.id, "Enter phone number or email:")
+            await send_message_with_retry(context.bot, update.effective_chat.id, "ဖုန်းနံပါတ် သို့မဟုတ် အီးမေးလ် ထည့်သွင်းပါ:")
             return
-        elif text == "🔙 Back to Main Menu":
+        elif text == "🔙 ပင်မမီနူး":
             user_state.pop(user_id, None)
             user_temp.pop(user_id, None)
-            await send_message_with_retry(context.bot, update.effective_chat.id, "Main Menu", reply_markup=make_main_keyboard(logged_in=False))
+            await send_message_with_retry(context.bot, update.effective_chat.id, "ပင်မမီနူး", reply_markup=make_main_keyboard(logged_in=False))
             return
         else:
-            await send_message_with_retry(context.bot, update.effective_chat.id, "Please choose a valid platform.", reply_markup=make_platform_keyboard())
+            await send_message_with_retry(context.bot, update.effective_chat.id, "ကျေးဇူးပြု၍ တရားဝင်ပလက်ဖောင်းကို ရွေးချယ်ပါ။", reply_markup=make_platform_keyboard())
             return
     
     if user_state.get(user_id, {}).get("state") == "WAIT_PHONE":
         if user_temp.get(user_id) and user_temp[user_id].get("platform"):
             user_temp[user_id]["phone"] = text
             user_state[user_id] = {"state": "WAIT_PASS"}
-            await send_message_with_retry(context.bot, update.effective_chat.id, "Enter password:")
+            await send_message_with_retry(context.bot, update.effective_chat.id, "စကားဝှက်ထည့်သွင်းပါ:")
             return
         else:
-            await send_message_with_retry(context.bot, update.effective_chat.id, "Platform not selected. Please start over.", reply_markup=make_main_keyboard(logged_in=False))
+            await send_message_with_retry(context.bot, update.effective_chat.id, "ပလက်ဖောင်းမရွေးချယ်ရသေးပါ။ ကျေးဇူးပြု၍ အစမှပြန်စပါ။", reply_markup=make_main_keyboard(logged_in=False))
             user_state.pop(user_id, None)
             user_temp.pop(user_id, None)
             return
@@ -1134,17 +1214,16 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             password = text
             base_url = user_temp[user_id]["base_url"]
             platform = user_temp[user_id]["platform"]
-            logging.info(f"Attempting login for user {user_id} on platform {platform}")
-            await send_message_with_retry(context.bot, update.effective_chat.id, "Logging in...")
+            logging.info(f"ဝင်ရောက်ရန် ကြိုးစားနေပါသည် အသုံးပြုသူ {user_id} အတွက် ပလက်ဖောင်း {platform} ပေါ်တွင်")
+            await send_message_with_retry(context.bot, update.effective_chat.id, "ဝင်ရောက်နေပါသည်...")
             
             res, session = login_request(phone, password, base_url)
             if session:
                 user_info = await get_user_info(session, user_id)
                 if user_info and user_info.get("user_id"):
                     game_user_id = user_info.get("user_id")
-                    # Check authorization for all platforms
-                    if str(game_user_id) not in allowed_user_ids:
-                        logging.warning(f"Unauthorized login attempt for user {user_id}, in-game ID {game_user_id} on platform {platform}")
+                    if platform == "777bigwingame" and game_user_id not in allowed_777bigwin_ids:
+                        logging.warning(f"ခွင့်ပြုချက်မရှိသော ဝင်ရောက်မှု အသုံးပြုသူ {user_id}, ဂိမ်းအိုင်ဒီ {game_user_id} ပလက်ဖောင်း {platform} ပေါ်တွင်")
                         session.close()
                         await send_message_with_retry(context.bot, update.effective_chat.id, 
                             f"🚫 ဝင်ခွင့် မရှိသေးပါ\n\n"
@@ -1181,18 +1260,18 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                         })
                     balance_display = balance if balance is not None else 0.0
                     await send_message_with_retry(context.bot, update.effective_chat.id, 
-                                                 f"✅ Login Successful!\nPlatform: {platform}\n🆔 : {user_info['user_id']}\n💰 Balance: {balance_display:.2f} MMK", 
+                                                 f"✅ ဝင်ရောက်မှုအောင်မြင်ပါသည်!\nပလက်ဖောင်း: {platform}\n🆔 : {user_info['user_id']}\n💰 လက်ကျန်: {balance_display:.2f} MMK", 
                                                  reply_markup=make_main_keyboard(logged_in=True))
                 else:
-                    await send_message_with_retry(context.bot, update.effective_chat.id, "Login failed: Could not retrieve user info", reply_markup=make_main_keyboard(logged_in=False))
+                    await send_message_with_retry(context.bot, update.effective_chat.id, "ဝင်ရောက်မှုမအောင်မြင်ပါ: အသုံးပြုသူအချက်အလက်ရယူ၍မရပါ", reply_markup=make_main_keyboard(logged_in=False))
             else:
-                msg = res.get("msg", "Login failed")
-                await send_message_with_retry(context.bot, update.effective_chat.id, f"Login error: {msg}", reply_markup=make_main_keyboard(logged_in=False))
+                msg = res.get("msg", "ဝင်ရောက်မှုမအောင်မြင်ပါ")
+                await send_message_with_retry(context.bot, update.effective_chat.id, f"ဝင်ရောက်မှုအမှား: {msg}", reply_markup=make_main_keyboard(logged_in=False))
             user_state.pop(user_id, None)
             user_temp.pop(user_id, None)
             return
         else:
-            await send_message_with_retry(context.bot, update.effective_chat.id, "Login session expired. Please start over.", reply_markup=make_main_keyboard(logged_in=False))
+            await send_message_with_retry(context.bot, update.effective_chat.id, "ဝင်ရောက်မှုသက်တမ်းကုန်သွားပါပြီ။ ကျေးဇူးပြု၍ အစမှပြန်စပါ။", reply_markup=make_main_keyboard(logged_in=False))
             user_state.pop(user_id, None)
             user_temp.pop(user_id, None)
             return
@@ -1200,56 +1279,72 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not await check_user_authorized(update, context):
         return
     
-    if text == "💰 Check Balance":
+    if text == "💰လက်ကျန်ငွေ💰":
         await account_balance_handler(update, context)
         return
     
-    if text == "⭐ KM_Enhance":
+    if text == "⭐KM_Enhance⭐":
         await km_enhance_handler(update, context)
+        return
+    
+    if text == "🎲 ဖော်မြူလာ ဖလှယ်ရေး":
+        await formula_exchange_handler(update, context)
+        return
+    
+    if text == "🛞 Straight":
+        await straight_formula_handler(update, context)
+        return
+    
+    if text == "🧭 Reverse":
+        await reverse_formula_handler(update, context)
+        return
+    
+    if text == "🤑 BACK Formula":
+        await back_formula_handler(update, context)
         return
     
     if text in ["👑 Mr King", "💎 V 1", "🎰 Lottery Father", "🤖 AI WAVE", "🤖 AI King", "🤖 AI Chat", "📈 Lottery Follow", "🧠 Lottery Brain", "⭐ KM_Enhance"]:
         if text == "👑 Mr King":
             user_settings[user_id]["pattern"] = "SBSBSBBSBSBBSBBSSBSBSBBBSBBBSSSBSBSBBSBSSSBSSSBBBBSSSBSBSBBBSSSSBBBBBSBSSSBSSSBSSBBBSBSS"
             user_settings[user_id]["pattern_type"] = "sequential"
-            await send_message_with_retry(context.bot, update.effective_chat.id, "✅ Strategy Set: 👑 Mr King", reply_markup=make_main_keyboard(logged_in=True))
+            await send_message_with_retry(context.bot, update.effective_chat.id, "✅ နည်းဗျူဟာ သတ်မှတ်ပြီးပါပြီ: 👑 Mr King", reply_markup=make_main_keyboard(logged_in=True))
         elif text == "💎 V 1":
             user_settings[user_id]["pattern"] = "SBSSSBBBBBSSBBSSSBBSSSBSSBBBSBBSSBSSBSBSBSSSBBSBSSSSSBBBSBBSBBBSBSBBBBSBSSBBSSSBBBSSBSBSBBBBSBS"
             user_settings[user_id]["pattern_type"] = "sequential"
-            await send_message_with_retry(context.bot, update.effective_chat.id, "✅ Strategy Set: 💎 V 1", reply_markup=make_main_keyboard(logged_in=True))
+            await send_message_with_retry(context.bot, update.effective_chat.id, "✅ နည်းဗျူဟာ သတ်မှတ်ပြီးပါပြီ: 💎 V 1", reply_markup=make_main_keyboard(logged_in=True))
         elif text == "🎰 Lottery Father":
             user_settings[user_id]["pattern"] = "BSBBSBSSBSSBSBBSBBSBSSBBSBSSBSBSSSSBSBBBBSSSSSSSBSSSBBSBBSBSSBSSBSBBSSSSSSSBSSSBBSSSSBSBBBBSBBSBSSBBSBSSBS"
             user_settings[user_id]["pattern_type"] = "sequential"
-            await send_message_with_retry(context.bot, update.effective_chat.id, "✅ Strategy Set: 🎰 Lottery Father", reply_markup=make_main_keyboard(logged_in=True))
+            await send_message_with_retry(context.bot, update.effective_chat.id, "✅ နည်းဗျူဟာ သတ်မှတ်ပြီးပါပြီ: 🎰 Lottery Father", reply_markup=make_main_keyboard(logged_in=True))
         elif text == "🤖 AI WAVE":
             user_settings[user_id]["pattern"] = "SSBBSSSSSBSSBBBBSBSSBSSBSBBSSBBBSBSSSBSSSSBBSSSSSBSSBBBBSBSSBSSBSBBSSBBBSBSSSBSSSSBBSSSSSBSSBBBBSBSS"
             user_settings[user_id]["pattern_type"] = "sequential"
-            await send_message_with_retry(context.bot, update.effective_chat.id, "✅ Strategy Set: 🤖 AI WAVE", reply_markup=make_main_keyboard(logged_in=True))
+            await send_message_with_retry(context.bot, update.effective_chat.id, "✅ နည်းဗျူဟာ သတ်မှတ်ပြီးပါပြီ: 🤖 AI WAVE", reply_markup=make_main_keyboard(logged_in=True))
         elif text == "🤖 AI King":
-            user_settings[user_id]["pattern"] = "SSBBSSSSSBSSBBSSBSSBBBBSBSS"
+            user_settings[user_id]["pattern"] = "SSBBSSSSSBSSBBBBSBSSBSSBSBBSSBBBSBSSSBSSSBBSSSSSBSSBBBBSBSS"
             user_settings[user_id]["pattern_type"] = "sequential"
-            await send_message_with_retry(context.bot, update.effective_chat.id, "✅ Strategy Set: 🤖 AI King", reply_markup=make_main_keyboard(logged_in=True))
+            await send_message_with_retry(context.bot, update.effective_chat.id, "✅ နည်းဗျူဟာ သတ်မှတ်ပြီးပါပြီ: 🤖 AI King", reply_markup=make_main_keyboard(logged_in=True))
         elif text == "🤖 AI Chat":
             user_settings[user_id]["pattern"] = "BSBBSBBSBSSSBBSSSSSBSSBBBBSBSSBSSBSBBSSBBBSBSSSBSSSSBBSSSSSBSSBBBBSBSSBSSBSBBSSBBBSBSSSBSSSSBBSSSSSBSSBBBBSBSSBSBSBSBSBSBBSSBSSBBSBSSBBSBBSSBBBSSSSSBBSBBSSBSSBBBSBSSSBSBBSSBSBBBSBBBBSSSSSBBSBSSSBSBBBBBSBSSSBSBSSBSSBBSBBBSSSSSBBBBBSBBBSBSSSBBBBBSSSSSBSSSSSBBBBBBSSSSSBBSBSBSBSBSBBBBSSSSSBSSBBSBBSSBBSBSSSBSBBSBBSSBSSBBBBSSSSSBBBBSSBSBBBSBBSSBSSBBSBSBSSSBSBBBBBSBSSSBSBSSBSSBBSBBBSBBSSBSSBSBBBSBSSSBBBBBSSSSSBSSSSSBBBBBBSSSSSBBBBBSBSBSBSBSBBBBSSSSSBSSBBSBBSSBBSBSSSBSBBSBBSSBSSBSBSSBSSBSBBBSSBBBBBSBBSSSSBSBBSBBSBSSBBSSSBSBBBSBBBBSSBBBBBSBBSSSBBBSBBBSBBBSBBBSBBSSBSSSBBSSBBSSBBBSBBBSBBBSBBBBBSSSSSSBBSSSSBSBSSSSBBSSSSBBSSSSSBSSSSBSBBBSBBBSBBSSBBBSBBBSBBBSBBBSBBSBSBSBSBSBSBBSSBSSBBSBSSBBSBBSSBBBSSSSSBBSBBSSBSSBBBSBSSSBSBBSSBSBBBSBBBBSSSSSBBSBSSSBSBBBBBSBSSSBSBSSBSSBBSBBBSSSSSBBBBBSBBBSBSSSBBBBBSSSSSBSSSSSBBBBBBSSSSSBBSBSBSBSBSBBBBSSSSSBSSBBSBBSSBBSBSSSBSBBSBBSSBSSBBBBSSSSSBBBBSSBSBBBSBBSSBSSBBSBSBSSSBSBBBBBSBSSSBSBSSBSSBBSBBBSBBSSBSSBSBBBSBSSSBBBBBSSSSSBSSSSSBBBBBBSSSSSBBBBBSBSBSBSBSBBBBSSSSSBSSBBSBBSSBBSBSSSBSBBSBBSSBSSB"
             user_settings[user_id]["pattern_type"] = "sequential"
-            await send_message_with_retry(context.bot, update.effective_chat.id, "✅ Strategy Set: 🤖 AI Chat", reply_markup=make_main_keyboard(logged_in=True))
+            await send_message_with_retry(context.bot, update.effective_chat.id, "✅ နည်းဗျူဟာ သတ်မှတ်ပြီးပါပြီ: 🤖 AI Chat", reply_markup=make_main_keyboard(logged_in=True))
         elif text == "📈 Lottery Follow":
             user_settings[user_id]["pattern_type"] = "lottery_follow"
-            await send_message_with_retry(context.bot, update.effective_chat.id, "✅ Strategy Set: 📈 Lottery Follow\nFollowing last result", reply_markup=make_main_keyboard(logged_in=True))
+            await send_message_with_retry(context.bot, update.effective_chat.id, "✅ နည်းဗျူဟာ သတ်မှတ်ပြီးပါပြီ: 📈 Lottery Follow\nနောက်ဆုံးရလဒ်ကို လိုက်ပါမည်", reply_markup=make_main_keyboard(logged_in=True))
         elif text == "🧠 Lottery Brain":
             user_settings[user_id]["pattern_type"] = "lottery_brain"
-            await send_message_with_retry(context.bot, update.effective_chat.id, "✅ Strategy Set: 🧠 Lottery Brain\nBetting opposite to last result", reply_markup=make_main_keyboard(logged_in=True))
+            await send_message_with_retry(context.bot, update.effective_chat.id, "✅ နည်းဗျူဟာ သတ်မှတ်ပြီးပါပြီ: 🧠 Lottery Brain\nနောက်ဆုံးရလဒ်နှင့် ဆန့်ကျင်ဘက် လောင်းမည်", reply_markup=make_main_keyboard(logged_in=True))
         elif text == "⭐ KM_Enhance":
             await km_enhance_handler(update, context)
             return
         return
     
-    if text == "🔙 Back to Main Menu":
-        await send_message_with_retry(context.bot, update.effective_chat.id, "Main Menu", reply_markup=make_main_keyboard(logged_in=True))
+    if text == "🔙 ပင်မမီနူး":
+        await send_message_with_retry(context.bot, update.effective_chat.id, "ပင်မမီနူး", reply_markup=make_main_keyboard(logged_in=True))
         return
     
-    if text == "🖨️ Check Info":
-        logging.info(f"User {user_id} clicked Check Info")
+    if text == "🖨️ ဆက်တင်အချက်အလက် ကူးယူမယ် 🖨️":
+        logging.info(f"User {user_id} clicked COPY SETTINGS INFORMA")
         
         session = user_sessions.get(user_id)
         user_info = await get_user_info(session, user_id) if session else None
@@ -1284,16 +1379,102 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             f"🎲 Formula Mode: {formula_display}\n"
             f"💵 Betting Strategy: {betting_strategy}\n"
             f"💸 Bet Sequence: {', '.join(map(str, bet_sizes)) if bet_sizes else ''}\n"
-            f"📊 Current Bet Index: {settings.get('bet_index', 0) + 1}/{len(bet_sizes) if bet_sizes else 0}\n"
             f"🎯 Profit Target: {f'{profit_target:.2f} MMK' if isinstance(profit_target, (int, float)) else ''}\n"
-            f"⛔ Stop Loss: {f'{stop_loss:.2f} MMK' if isinstance(stop_loss, (int, float)) else ''}\n"
+            f"🛑 Stop Loss: {f'{stop_loss:.2f} MMK' if isinstance(stop_loss, (int, float)) else ''}\n"
             f"🚨 SL Limit: {sl_limit if sl_limit is not None else ''}\n"
             f"📈 Total Profit: {stats['profit']:.2f} MMK\n"
             f"✅ Win Count: {stats.get('win_count', 0)}\n"
-            f"📉 Consecutive Losses: {settings.get('consecutive_losses', 0)}\n"
-            f"🚀 Running: {'Yes' if settings.get('running', False) else 'No'}"
+            f"🚀 Running: {'Yes' if settings.get('running', False) else 'No'}\n\n"
+            f"📋 ဤအချက်အလက်ကို ကူးယူပြီး ဆက်တင်များမျှဝေရန်!"
         )
+        
         await send_message_with_retry(context.bot, update.effective_chat.id, info_text, reply_markup=make_main_keyboard(logged_in=True))
+        return
+    
+    if "🆔 User ID:" in text and "💰 Balance:" in text and "🧠 Strategy:" in text:
+        logging.info(f"User {user_id} pasted settings info for import")
+        
+        def extract_value(key_start: str, text_data: str) -> str:
+            try:
+                for line in text_data.split('\n'):
+                    if line.startswith(key_start):
+                        value = line.split(':', 1)[1].strip()
+                        return value
+            except Exception:
+                pass
+            return ""
+        
+        try:
+            game_type_raw = extract_value("🎮 Game:", text)
+            formula_mode_raw = extract_value("🎲 Formula Mode:", text)
+            betting_strategy_raw = extract_value("💵 Betting Strategy:", text)
+            bet_sizes_raw = extract_value("💸 Bet Sequence:", text)
+            strategy_display_name = extract_value("🧠 Strategy:", text)
+            target_profit_raw = extract_value("🎯 Profit Target:", text)
+            stop_loss_raw = extract_value("🛑 Stop Loss:", text)
+            sl_limit_raw = extract_value("🚨 SL Limit:", text)
+            
+            settings = user_settings.get(user_id, {})
+            
+            if game_type_raw in ["WINGO", "TRX"]:
+                settings["game_type"] = game_type_raw
+            
+            if "Straight" in formula_mode_raw:
+                settings["formula_mode"] = "straight"
+            elif "Reverse" in formula_mode_raw:
+                settings["formula_mode"] = "reverse"
+            elif "BACK" in formula_mode_raw:
+                settings["formula_mode"] = "back"
+            
+            if betting_strategy_raw:
+                if "Anti" in betting_strategy_raw:
+                    settings["betting_strategy"] = "Anti-Martingale"
+                elif "D'Alembert" in betting_strategy_raw:
+                    settings["betting_strategy"] = "D'Alembert"
+                else:
+                    settings["betting_strategy"] = "Martingale"
+            
+            if bet_sizes_raw:
+                bet_sizes = []
+                for num in bet_sizes_raw.replace(',', ' ').split():
+                    if num.strip().isdigit():
+                        bet_sizes.append(int(num.strip()))
+                if bet_sizes:
+                    settings["bet_sizes"] = bet_sizes
+            
+            if strategy_display_name:
+                strategy_data = get_strategy_by_display_name(strategy_display_name)
+                if strategy_data:
+                    settings["pattern_type"] = strategy_data["pattern_type"]
+                    if strategy_data["pattern_type"] == "sequential" and "pattern" in strategy_data:
+                        settings["pattern"] = strategy_data["pattern"]
+            
+            if target_profit_raw and target_profit_raw.replace('.', '', 1).isdigit():
+                settings["target_profit"] = float(target_profit_raw.replace(' MMK', '').strip())
+            
+            if stop_loss_raw and stop_loss_raw.replace('.', '', 1).isdigit():
+                settings["stop_loss"] = float(stop_loss_raw.replace(' MMK', '').strip())
+            
+            if sl_limit_raw and sl_limit_raw.strip().isdigit():
+                settings["sl_limit"] = int(sl_limit_raw.strip())
+            
+            settings["pattern_index"] = 0
+            settings["consecutive_losses"] = 0
+            settings["skip_betting"] = False
+            settings["bet_index"] = 0
+            settings["original_bet_index"] = 0
+            
+            await send_message_with_retry(context.bot, update.effective_chat.id, 
+                                         "✅ ဆက်တင်များ တင်သွင်းခြင်း အောင်မြင်ပါသည်!\n"
+                                         "'🖨️ အချက်အလက်စစ်မယ်' ကိုသုံးပြီး သင်၏ဆက်တင်များကို စစ်ဆေးပါ။\n"
+                                         "ထို့နောက် '✅ စတင်မယ်' ကိုနှိပ်ပါ။",
+                                         reply_markup=make_main_keyboard(logged_in=True))
+            
+        except Exception as e:
+            logging.error(f"Error importing settings for user {user_id}: {e}")
+            await send_message_with_retry(context.bot, update.effective_chat.id, 
+                                         "❌ ဆက်တင်များ တင်သွင်းခြင်း မအောင်မြင်ပါ။ ကျေးဇူးပြု၍ ပုံစံကို စစ်ဆေးပါ။",
+                                         reply_markup=make_main_keyboard(logged_in=True))
         return
     
     try:
@@ -1305,19 +1486,29 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             user_settings[user_id]["bet_index"] = 0
             user_settings[user_id]["original_bet_index"] = 0
             await send_message_with_retry(context.bot, update.effective_chat.id, 
-                                         f"💵 Bet Sequence set: {', '.join(map(str, bet_sizes))} MMK\n\n"
-                                         f"Win = Reset to first amount\n"
-                                         f"Loss = Move to next amount\n"
-                                         f"SL Limit reached = Bet 0mmk until win, then move to next index",
+                                         f"💵 ထိုးကြေးအဆင့်များ သတ်မှတ်ပြီးပါပြီ: {', '.join(map(str, bet_sizes))} MMK\n\n"
+                                         f"အနိုင် = ပထမပမာဏသို့ ပြန်သွားမည်\n"
+                                         f"ရှုံး = နောက်တစ်ဆင့်သို့ ရွှေ့မည်\n"
+                                         f"SL ကန့်သတ်ချက်ရောက်လျှင် = အနိုင်ရသည်အထိ 0mmk ထိုးမည်၊ ထို့နောက် နောက်တစ်ဆင့်သို့ ရွှေ့မည်",
                                          reply_markup=make_main_keyboard(logged_in=True))
             user_state.pop(user_id, None)
+        
+        elif user_state.get(user_id, {}).get("state") == "INPUT_BET_ORDER":
+            pattern = lines[1] if len(lines) >= 2 else text
+            if all(c in "BS" for c in pattern.upper()) and pattern:
+                user_settings[user_id]["pattern"] = pattern.upper()
+                user_settings[user_id]["pattern_type"] = "sequential"
+                await send_message_with_retry(context.bot, update.effective_chat.id, f"📝 Manual BS သတ်မှတ်ပြီးပါပြီ: {pattern.upper()}", reply_markup=make_main_keyboard(logged_in=True))
+                user_state.pop(user_id, None)
+            else:
+                await send_message_with_retry(context.bot, update.effective_chat.id, "ထိုးအစဉ် မမှန်ကန်ပါ။ B သို့မဟုတ် S ကိုသာ သုံးပါ:\nBet_Order\nBSBBSSBSBBS", reply_markup=make_main_keyboard(logged_in=True))
         
         elif user_state.get(user_id, {}).get("state") == "INPUT_PROFIT_TARGET":
             target = float(lines[1] if len(lines) >= 2 else text)
             if target <= 0:
                 raise ValueError
             user_settings[user_id]["target_profit"] = target
-            await send_message_with_retry(context.bot, update.effective_chat.id, f"🎯 Profit Target set: {target:.2f} MMK", reply_markup=make_main_keyboard(logged_in=True))
+            await send_message_with_retry(context.bot, update.effective_chat.id, f"🎯 အမြတ်ပစ်မှတ် သတ်မှတ်ပြီးပါပြီ: {target:.2f} MMK", reply_markup=make_main_keyboard(logged_in=True))
             user_state.pop(user_id, None)
         
         elif user_state.get(user_id, {}).get("state") == "INPUT_STOP_LIMIT":
@@ -1325,7 +1516,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             if stop_loss <= 0:
                 raise ValueError
             user_settings[user_id]["stop_loss"] = stop_loss
-            await send_message_with_retry(context.bot, update.effective_chat.id, f"⛔ Stop Loss set: {stop_loss:.2f} MMK", reply_markup=make_main_keyboard(logged_in=True))
+            await send_message_with_retry(context.bot, update.effective_chat.id, f"⛔ အရှုံးကန့်သတ်ချက် သတ်မှတ်ပြီးပါပြီ: {stop_loss:.2f} MMK", reply_markup=make_main_keyboard(logged_in=True))
             user_state.pop(user_id, None)
         
         elif user_state.get(user_id, {}).get("state") == "INPUT_SL_LIMIT":
@@ -1336,10 +1527,10 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             user_settings[user_id]["consecutive_losses"] = 0
             user_settings[user_id]["skip_betting"] = False
             await send_message_with_retry(context.bot, update.effective_chat.id, 
-                                         f"🚨 SL Limit set: {sl_limit if sl_limit is not None else ''} consecutive losses\n\n"
-                                         f"When {sl_limit} consecutive losses reached:\n"
-                                         f"- Bet 0mmk until win\n"
-                                         f"- Then move to NEXT index (not back to original)",
+                                         f"🚨 SL ကန့်သတ်ချက် သတ်မှတ်ပြီးပါပြီ: {sl_limit if sl_limit is not None else ''} ဆက်တိုက်ရှုံး\n\n"
+                                         f"{sl_limit} ဆက်တိုက်ရှုံးသောအခါ:\n"
+                                         f"- အနိုင်ရသည်အထိ 0mmk ထိုးမည်\n"
+                                         f"- ထို့နောက် နောက်တစ်ဆင့်သို့ ရွှေ့မည် (မူလသို့မဟုတ်ပါ)",
                                          reply_markup=make_main_keyboard(logged_in=True))
             user_state.pop(user_id, None)
         
@@ -1347,33 +1538,57 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             game_type = text.upper()
             if game_type in ["WINGO", "TRX"]:
                 user_settings[user_id]["game_type"] = game_type
-                await send_message_with_retry(context.bot, update.effective_chat.id, f"🎮 Game set: {game_type}", reply_markup=make_main_keyboard(logged_in=True))
+                await send_message_with_retry(context.bot, update.effective_chat.id, f"🎮 ဂိမ်း သတ်မှတ်ပြီးပါပြီ: {game_type}", reply_markup=make_main_keyboard(logged_in=True))
                 user_state.pop(user_id, None)
             else:
-                await send_message_with_retry(context.bot, update.effective_chat.id, "Invalid game type. Enter WINGO or TRX", reply_markup=make_main_keyboard(logged_in=True))
+                await send_message_with_retry(context.bot, update.effective_chat.id, "ဂိမ်းအမျိုးအစား မမှန်ကန်ပါ။ WINGO သို့မဟုတ် TRX ထည့်ပါ", reply_markup=make_main_keyboard(logged_in=True))
         
         else:
-            if text == "💵 Bet Sequence":
+            if text == "💵 ထိုးကြေးအဆင့်များ":
                 user_state[user_id] = {"state": "INPUT_BET_SIZES"}
                 await send_message_with_retry(context.bot, update.effective_chat.id, 
-                                             "Enter bet sequence as:\nBet_Sequence\n0\n10\n20\n30\n\n"
-                                             "Example: 0,10,20,30\n(0 = Free Bet, Used for SL mode)",
+                                             "ထိုးကြေးအဆင့်များ ထည့်သွင်းပါ:\nBet_Sequence\n0\n10\n20\n30\n\n"
+                                             "ဥပမာ: 0,10,20,30\n(0 = အခမဲ့ထိုး, SL မုဒ်အတွက် အသုံးပြုသည်)",
                                              reply_markup=make_main_keyboard(logged_in=True))
             
-            elif text == "🧠 Change Strategy":
-                await send_message_with_retry(context.bot, update.effective_chat.id, "Choose strategy:", reply_markup=make_strategy_keyboard())
+            elif text == "📝 Manual BS":
+                user_state[user_id] = {"state": "INPUT_BET_ORDER"}
+                await send_message_with_retry(context.bot, update.effective_chat.id, "ထိုးအစဉ် ထည့်သွင်းပါ\nBet_Order\nBSBBSSBSBBS", reply_markup=make_main_keyboard(logged_in=True))
             
-            elif text == "✅ Start":
+            elif text == "🎯 အမြတ်ပစ်မှတ်":
+                user_state[user_id] = {"state": "INPUT_PROFIT_TARGET"}
+                await send_message_with_retry(context.bot, update.effective_chat.id, "အမြတ်ပစ်မှတ် ထည့်သွင်းပါ\nProfit_Target\n100000", reply_markup=make_main_keyboard(logged_in=True))
+            
+            elif text == "⛔အရှုံးကန့်သတ်ချက်⛔":
+                user_state[user_id] = {"state": "INPUT_STOP_LIMIT"}
+                await send_message_with_retry(context.bot, update.effective_chat.id, "သင်၏ SL ပစ်မှတ် ထည့်သွင်းပါ\n\nဥပမာ: 100000", reply_markup=make_main_keyboard(logged_in=True))
+            
+            elif text == "🚨 SL ကန့်သတ်ချက်":
+                user_state[user_id] = {"state": "INPUT_SL_LIMIT"}
+                await send_message_with_retry(context.bot, update.effective_chat.id, 
+                                             "SL ထည့်သွင်းပါ:\nBet_SL\n3\n(0 သည် ပိတ်ရန်)\n\n"
+                                             "ဥပမာ: 2 ဆိုလျှင် ဆက်တိုက် 2 ကြိမ်ရှုံးပြီးနောက်၊\n"
+                                             "ဘော့သည် အနိုင်ရသည်အထိ 0mmk ထိုးမည်၊ ထို့နောက် နောက်တစ်ဆင့်သို့ ရွှေ့မည်",
+                                             reply_markup=make_main_keyboard(logged_in=True))
+            
+            elif text == "🎮 ဂိမ်းရွေးမယ်":
+                user_state[user_id] = {"state": "INPUT_GAME_TYPE"}
+                await send_message_with_retry(context.bot, update.effective_chat.id, "WINGO သို့မဟုတ် TRX", reply_markup=make_main_keyboard(logged_in=True))
+            
+            elif text == "🧠 နည်းဗျူဟာပြောင်းမယ်":
+                await send_message_with_retry(context.bot, update.effective_chat.id, "နည်းဗျူဟာရွေးချယ်ပါ:", reply_markup=make_strategy_keyboard())
+            
+            elif text == "✅ စတင်မယ်":
                 settings = user_settings.get(user_id, {})
                 logging.info(f"Start command for user {user_id}, settings: {settings}")
                 if not settings.get("bet_sizes"):
-                    await send_message_with_retry(context.bot, update.effective_chat.id, "Set 💵 Bet Sequence first!", reply_markup=make_main_keyboard(logged_in=True))
+                    await send_message_with_retry(context.bot, update.effective_chat.id, "ဦးစွာ 💵 ထိုးကြေးအဆင့်များ သတ်မှတ်ပါ!", reply_markup=make_main_keyboard(logged_in=True))
                     return
                 if settings.get("pattern_type", "sequential") == "sequential" and not settings.get("pattern"):
-                    await send_message_with_retry(context.bot, update.effective_chat.id, "Select a strategy from 🧠 Change Strategy first!", reply_markup=make_main_keyboard(logged_in=True))
+                    await send_message_with_retry(context.bot, update.effective_chat.id, "ဦးစွာ 📝 Manual BS သတ်မှတ်ပါ!", reply_markup=make_main_keyboard(logged_in=True))
                     return
                 if settings.get("running"):
-                    await send_message_with_retry(context.bot, update.effective_chat.id, "Bot already running!", reply_markup=make_main_keyboard(logged_in=True))
+                    await send_message_with_retry(context.bot, update.effective_chat.id, "ဘော့ လုပ်ဆောင်နေပြီးသားဖြစ်သည်!", reply_markup=make_main_keyboard(logged_in=True))
                     return
                 settings["martin_index"] = 0
                 settings["dalembert_units"] = 1
@@ -1388,10 +1603,10 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 task = asyncio.create_task(betting_worker(user_id, update.effective_chat.id, context))
                 settings["task"] = task
             
-            elif text == "⛔ Stop":
+            elif text == "⛔ ရပ်မယ်":
                 settings = user_settings.get(user_id, {})
                 if not settings.get("running"):
-                    await send_message_with_retry(context.bot, update.effective_chat.id, "Bot not running!", reply_markup=make_main_keyboard(logged_in=True))
+                    await send_message_with_retry(context.bot, update.effective_chat.id, "ဘော့ လုပ်ဆောင်နေခြင်းမရှိပါ!", reply_markup=make_main_keyboard(logged_in=True))
                     return
                 settings["running"] = False
                 if settings.get("task"):
@@ -1400,52 +1615,70 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 user_waiting_for_result.pop(user_id, None)
                 session = user_sessions.get(user_id)
                 current_balance = await get_user_balance(session, user_id) if session else None
-                balance_text = f"Balance: {current_balance:.2f} MMK\n" if current_balance is not None else ""
-                await send_message_with_retry(context.bot, update.effective_chat.id, f"Bot stopped!\n{balance_text}", reply_markup=make_main_keyboard(logged_in=True))
+                balance_text = f"လက်ကျန်: {current_balance:.2f} MMK\n" if current_balance is not None else ""
+                await send_message_with_retry(context.bot, update.effective_chat.id, f"ဘော့ရပ်နားပါပြီ!\n{balance_text}", reply_markup=make_main_keyboard(logged_in=True))
             
-            elif text == "🎮 Choose Game":
-                user_state[user_id] = {"state": "INPUT_GAME_TYPE"}
-                await send_message_with_retry(context.bot, update.effective_chat.id, "WINGO or TRX", reply_markup=make_main_keyboard(logged_in=True))
-            
-            elif text == "🎯 Profit Target":
-                user_state[user_id] = {"state": "INPUT_PROFIT_TARGET"}
-                await send_message_with_retry(context.bot, update.effective_chat.id, "Enter profit target as\nProfit_Target\n100000", reply_markup=make_main_keyboard(logged_in=True))
-            
-            elif text == "⛔ Stop Loss":
-                user_state[user_id] = {"state": "INPUT_STOP_LIMIT"}
-                await send_message_with_retry(context.bot, update.effective_chat.id, "Enter Your SL Target\n\nExample: 100000", reply_markup=make_main_keyboard(logged_in=True))
-            
-            elif text == "🚨 SL Limit":
-                user_state[user_id] = {"state": "INPUT_SL_LIMIT"}
-                await send_message_with_retry(context.bot, update.effective_chat.id, 
-                                             "Enter SL as:\nBet_SL\n3\n(0 to disable)\n\n"
-                                             "Example: 2 means after 2 consecutive losses,\n"
-                                             "bot will bet 0mmk until win, then move to NEXT index",
-                                             reply_markup=make_main_keyboard(logged_in=True))
+            elif text == "🖨️ အချက်အလက်စစ်မယ်":
+                session = user_sessions.get(user_id)
+                user_info = await get_user_info(session, user_id) if session else None
+                settings = user_settings.get(user_id, {})
+                balance = await get_user_balance(session, user_id) if session else None
+                bet_sizes = settings.get("bet_sizes", [])
+                profit_target = settings.get("target_profit")
+                stop_loss = settings.get("stop_loss")
+                sl_limit = settings.get("sl_limit")
+                betting_strategy = settings.get("betting_strategy", "Martingale")
+                game_type = settings.get("game_type", "WINGO")
+                formula_mode = settings.get("formula_mode", "straight")
+                
+                strategy_display = get_strategy_display_name(settings)
+                
+                if formula_mode == "straight":
+                    formula_display = "🛞 Straight"
+                elif formula_mode == "reverse":
+                    formula_display = "🧭 Reverse"
+                elif formula_mode == "back":
+                    formula_display = "🤑 BACK"
+                else:
+                    formula_display = formula_mode
+                
+                stats = user_stats.get(user_id, {"profit": 0.0, "win_count": 0})
+                
+                info_text = (
+                    f"🆔 User ID: {user_info.get('user_id', 'N/A') if user_info else 'N/A'}\n"
+                    f"💰 လက်ကျန်: {balance:.2f} MMK\n"
+                    f"🎮 ဂိမ်း: {game_type}\n"
+                    f"🧠 နည်းဗျူဟာ: {strategy_display}\n"
+                    f"🎲 ဖော်မြူလာမုဒ်: {formula_display}\n"
+                    f"💵 ထိုးနည်းဗျူဟာ: {betting_strategy}\n"
+                    f"💸 ထိုးကြေးအဆင့်များ: {', '.join(map(str, bet_sizes)) if bet_sizes else ''}\n"
+                    f"📊 လက်ရှိထိုးအဆင့်: {settings.get('bet_index', 0) + 1}/{len(bet_sizes) if bet_sizes else 0}\n"
+                    f"🎯 အမြတ်ပစ်မှတ်: {f'{profit_target:.2f} MMK' if isinstance(profit_target, (int, float)) else ''}\n"
+                    f"⛔ အရှုံးကန့်သတ်ချက်: {f'{stop_loss:.2f} MMK' if isinstance(stop_loss, (int, float)) else ''}\n"
+                    f"🚨 SL ကန့်သတ်ချက်: {sl_limit if sl_limit is not None else ''}\n"
+                    f"📈 စုစုပေါင်းအမြတ်: {stats['profit']:.2f} MMK\n"
+                    f"✅ အနိုင်အရေအတွက်: {stats.get('win_count', 0)}\n"
+                    f"📉 ဆက်တိုက်ရှုံး: {settings.get('consecutive_losses', 0)}\n"
+                    f"🚀 လုပ်ဆောင်နေသလား: {'ဟုတ်ကဲ့' if settings.get('running', False) else 'မဟုတ်ပါ'}"
+                )
+                await send_message_with_retry(context.bot, update.effective_chat.id, info_text, reply_markup=make_main_keyboard(logged_in=True))
             
             else:
-                await send_message_with_retry(context.bot, update.effective_chat.id, "Invalid command or input.", reply_markup=make_main_keyboard(logged_in=True))
+                await send_message_with_retry(context.bot, update.effective_chat.id, "မမှန်ကန်သော အမိန့် သို့မဟုတ် ထည့်သွင်းမှု။", reply_markup=make_main_keyboard(logged_in=True))
             
     except ValueError as e:
-        await send_message_with_retry(context.bot, update.effective_chat.id, f"Invalid input: {str(e)}", reply_markup=make_main_keyboard(logged_in=True))
+        await send_message_with_retry(context.bot, update.effective_chat.id, f"ထည့်သွင်းမှု မမှန်ကန်ပါ: {str(e)}", reply_markup=make_main_keyboard(logged_in=True))
     except Exception as e:
         logging.error(f"Error handling input for user {user_id}: {str(e)}")
-        await send_message_with_retry(context.bot, update.effective_chat.id, f"Error: {str(e)}", reply_markup=make_main_keyboard(logged_in=True))
+        await send_message_with_retry(context.bot, update.effective_chat.id, f"အမှား: {str(e)}", reply_markup=make_main_keyboard(logged_in=True))
 
 def main():
-    # Load allowed users from file
     load_allowed_users()
-    
-    # Start Flask server in a separate thread for Render health checks
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    
-    # Create and run the bot
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", cmd_start_handler))
     application.add_handler(CommandHandler("allow", cmd_allow_handler))
     application.add_handler(CommandHandler("remove", cmd_remove_handler))
+    application.add_handler(CallbackQueryHandler(callback_query_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
