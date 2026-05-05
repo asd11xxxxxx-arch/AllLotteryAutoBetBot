@@ -519,7 +519,7 @@ async def win_lose_checker(context: ContextTypes.DEFAULT_TYPE):
                                     current_balance = await get_user_balance(session, user_id)
                                     
                                     skip_betting_status = "SL" if settings.get("skip_betting", False) else ""
-                                    original_index_info = f" (Was at index {original_bet_index+1}: {bet_sizes[original_bet_index] if original_bet_index < len(bet_sizes) else 'N/A'} MMK)" if settings.get("skip_betting", False) and is_win else ""
+                                    original_index_info = f" (ညွှန်းကိန်း {original_bet_index+1} တွင်ရှိခဲ့သည်: {bet_sizes[original_bet_index] if original_bet_index < len(bet_sizes) else 'N/A'} MMK)" if settings.get("skip_betting", False) and is_win else ""
                                     
                                     if amount > 0:
                                         if is_win:
@@ -1098,7 +1098,7 @@ async def cmd_start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logged_in = user_id in user_sessions
     
     welcome_message = (
-        "🌟 မင်္ဂလာပါ ကြိုဆိုပါတယ်\n\n"
+        "🌟 Hello Welcome ALL USER\n\n"
         "🪷 K RAW LOTTERY SUPER BOT\n\n"
         "🎰 LOTTERY (B,S) AUTO BET BOT\n\n"
         "────────────────────\n"
